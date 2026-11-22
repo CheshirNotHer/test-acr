@@ -1,4 +1,6 @@
 "use strict";
+/* Ссылка на веб-приложение Google Apps Script (режим «Контрольный экзамен») */
+const GOOGLE_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyQKZhYDZy6NMg1pfjnzMAX1M_FetYTftwZ_iEqsyB5rkwa7j_h9ABnC1dYJE_jK4LVQw/exec';
 /* ===== Конфигурация банков тестов: добавляйте новые файлы сюда ===== */
 const BANKS = [
   { file: "data/questions.json", title: "АЛоВТ" },
@@ -9,7 +11,7 @@ const $ = (id) => document.getElementById(id);
 const state = {
   questions: [], bankIndex: 0, settings: null,
   queue: [], answers: [], currentMode: null, currentTopic: null,
-  selected: null, checked: false, startTime: 0, timerId: null, deadline: 0, finishReason: "",
+  selected: null, checked: false, student: null, payload: null, startTime: 0, timerId: null, deadline: 0, finishReason: "",
 };
 
 /* ===== Утилиты ===== */
@@ -129,11 +131,13 @@ function prepareQuestion(q) {
 function startQuiz(mode, topic) {
   if (!state.questions.length) return;
   state.settings = readSettings();
+  if (mode === "control") state.settings = { ...state.settings, count: 20, minutes: 30, shuffle: true, instant: false };
+  else state.student = null;
   state.currentMode = mode; state.currentTopic = topic || null;
   const n = state.settings.count, all = state.questions;
   let list;
   if (mode === "full") list = shuffle(all);
-  else if (mode === "balanced" || mode === "exam") list = balancedPick(all, n);
+  else if (mode === "balanced" || mode === "exam" || mode === "control") list = balancedPick(all, n);
   else if (mode === "random") list = shuffle(all).slice(0, n);
   else if (mode === "topic") list = shuffle(all.filter((q) => q.topic === topic));
   if (!list || !list.length) return;
@@ -145,7 +149,7 @@ function startQuiz(mode, topic) {
   state.finishReason = "";
   clearInterval(state.timerId);
   $("timer").classList.add("hidden");
-  if (mode === "exam") {
+  if (mode === "exam" || mode === "control") {
     state.deadline = state.startTime + state.settings.minutes * 60000;
     $("timer").classList.remove("hidden");
     tick();
@@ -243,6 +247,59 @@ function finishQuiz() {
   $("errorsOnly").checked = false;
   renderReview();
   show("resultScreen");
+  $("sendStatus").className = "send-status hidden";
+  if (state.currentMode === "control" && state.student) {
+    state.payload = {
+      timestamp: minskTimestamp(new Date()),
+      studentName: state.student.name,
+      group: state.student.group,
+      subject: BANKS[state.bankIndex].title,
+      grade,
+      scoreText: `${correct} из ${total} (${percent}%)`,
+      timeSpent: formatSpent(Date.now() - state.startTime),
+    };
+    sendResults();
+  }
+}
+
+/* ===== Контрольный экзамен: время по Минску и отправка ===== */
+function minskTimestamp(d) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("ru-RU", {
+    timeZone: "Europe/Minsk", day: "2-digit", month: "2-digit", year: "numeric",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  }).formatToParts(d).map((p) => [p.type, p.value]));
+  return `${parts.day}.${parts.month}.${parts.year}, ${parts.hour}:${parts.minute}:${parts.second}`;
+}
+function formatSpent(ms) {
+  const t = Math.max(0, Math.round(ms / 1000));
+  return `${Math.floor(t / 60)} мин ${t % 60} сек`;
+}
+function setSendStatus(kind, html) {
+  const el = $("sendStatus");
+  el.className = "send-status " + kind;
+  el.innerHTML = html;
+}
+async function sendResults() {
+  setSendStatus("pending", "⏳ Отправка результатов в ведомость...");
+  try {
+    await fetch(GOOGLE_SCRIPT_URL, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify(state.payload) });
+    setSendStatus("ok", "✅ Результаты успешно отправлены преподавателю!");
+  } catch (err) {
+    console.error(err);
+    setSendStatus("bad", `⚠️ Не удалось отправить результаты. Проверьте подключение к интернету.<button type="button" id="resendBtn" class="btn btn-secondary">Повторить отправку</button>`);
+    $("resendBtn").addEventListener("click", sendResults);
+  }
+}
+function openControlModal() {
+  if (!state.questions.length) return;
+  $("controlSubject").textContent = BANKS[state.bankIndex].title;
+  $("controlModal").classList.remove("hidden");
+  validateControlForm();
+  $("studentName").focus();
+}
+function validateControlForm() {
+  const name = $("studentName").value.trim(), group = $("studentGroup").value.trim();
+  $("controlStart").disabled = !(name.length >= 5 && group.length > 0);
 }
 function renderReview() {
   const onlyErr = $("errorsOnly").checked;
@@ -276,7 +333,17 @@ function init() {
   $("darkToggle").addEventListener("change", (e) => applyTheme(e.target.checked));
   $("themeBtn").addEventListener("click", () => applyTheme(document.documentElement.dataset.theme !== "dark"));
 
-  document.querySelectorAll("button.mode-card").forEach((b) => b.addEventListener("click", () => startQuiz(b.dataset.mode)));
+  document.querySelectorAll("button.mode-card").forEach((b) => b.addEventListener("click", () => b.dataset.mode === "control" ? openControlModal() : startQuiz(b.dataset.mode)));
+  ["studentName", "studentGroup"].forEach((id) => $(id).addEventListener("input", validateControlForm));
+  $("controlCancel").addEventListener("click", () => $("controlModal").classList.add("hidden"));
+  $("controlForm").addEventListener("submit", (e) => {
+    e.preventDefault();
+    validateControlForm();
+    if ($("controlStart").disabled) return;
+    state.student = { name: $("studentName").value.trim(), group: $("studentGroup").value.trim() };
+    $("controlModal").classList.add("hidden");
+    startQuiz("control");
+  });
   $("topicStart").addEventListener("click", () => startQuiz("topic", $("topicSelect").value));
 
   $("options").addEventListener("click", (e) => { const el = e.target.closest(".option"); if (el) selectOption(Number(el.dataset.i)); });
